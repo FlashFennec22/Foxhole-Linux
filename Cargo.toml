@@ -2,61 +2,25 @@
 name = "foxhole"
 version = "0.1.9"
 edition = "2021"
-description = "One-click DNS ad blocker for Windows (AdGuard-style lists, Hagezi Pro++ by default)"
+description = "System-wide DNS ad blocker for Linux (AdGuard-style lists, Hagezi Pro++ by default)"
 
 [[bin]]
 name = "foxhole"
 path = "src/main.rs"
 
-[[bin]]
-name = "foxhole-tray"
-path = "src/bin/foxhole-tray.rs"
-
-[build-dependencies]
-# Embeds the version info, icon and application manifest (build.rs; Windows targets only).
-embed-resource = "3"
-
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hickory-proto = "0.26"
-# Verifies the signature on update manifests (src/update.rs). Pure Rust, no dependencies.
-minisign-verify = "0.3"
-# native-tls = Windows SChannel: uses the Windows certificate store, no C toolchain needed.
-# native-tls-alpn is required for HTTP/2: without ALPN, reqwest can only speak HTTP/1.1 over
-# native-tls, so concurrent DoH queries each need their own TLS connection instead of sharing one.
-# blocking: the tray's update checker (src/update.rs) runs on plain threads, not tokio.
-reqwest = { version = "0.12", default-features = false, features = ["native-tls-alpn", "http2", "blocking"] }
+# rustls: pure Rust TLS, so there's no OpenSSL to install or link against. Certificates are checked
+# against the system's trust store (/etc/ssl/certs), like the Windows build uses the Windows store.
+# rustls negotiates ALPN itself, so concurrent DoH queries share one HTTP/2 connection.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# Checks downloaded installers against the SHA-256 digest in the signed update manifest.
-sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-
-[target.'cfg(windows)'.dependencies]
-windows-service = "0.7"
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
-    "Win32_Networking_WinSock",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Registry",
-    "Win32_System_Services",
-    "Win32_System_Threading",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-] }
-winreg = "0.55"
-# tray app (src/bin/foxhole-tray.rs); tray-icon 0.19 pairs with tao 0.30
-tray-icon = "0.19"
-tao = "0.30"
 
 [profile.release]
 opt-level = 3

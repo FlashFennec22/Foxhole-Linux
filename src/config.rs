@@ -5,19 +5,22 @@ use std::path::PathBuf;
 
 pub const APP_NAME: &str = "Foxhole";
 
-/// %ProgramData%\Foxhole (service runs as LocalSystem, so use a machine-wide location).
+/// Blocklist cache and stats.json: /var/lib/foxhole, or the StateDirectory systemd hands the service.
 pub fn data_dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        let base = std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        base.join(APP_NAME)
-    }
-    #[cfg(not(windows))]
-    {
-        PathBuf::from(format!("./{}-data", APP_NAME.to_ascii_lowercase()))
-    }
+    systemd_dir("STATE_DIRECTORY", "/var/lib")
+}
+
+/// config.toml: /etc/foxhole, or the ConfigurationDirectory systemd hands the service. Only root
+/// can write there; the service itself only reads it.
+pub fn config_dir() -> PathBuf {
+    systemd_dir("CONFIGURATION_DIRECTORY", "/etc")
+}
+
+/// systemd sets these variables to a colon-separated list; we only ever ask for one directory.
+fn systemd_dir(var: &str, base: &str) -> PathBuf {
+    std::env::var_os(var)
+        .and_then(|v| v.to_str().and_then(|s| s.split(':').next()).filter(|s| !s.is_empty()).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(base).join(APP_NAME.to_ascii_lowercase()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,20 +112,33 @@ impl Default for UpstreamConfig {
 
 impl Config {
     pub fn path() -> PathBuf {
-        data_dir().join("config.toml")
+        config_dir().join("config.toml")
     }
 
-    pub fn load_or_create() -> Result<Self> {
-        let path = Self::path();
-        std::fs::create_dir_all(data_dir()).context("creating data directory")?;
-        if path.exists() {
-            let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-            return toml::from_str(&text).with_context(|| format!("parsing {}", path.display()));
-        }
-        let cfg = Config::default();
-        let header = "# Foxhole configuration. Restart the service after editing (`foxhole on`).\n\
+    /// A commented config.toml with every setting at its default, for the installer to write out.
+    pub fn default_toml() -> Result<String> {
+        let header = "# Foxhole configuration. Run `foxhole on` after editing to apply it.\n\
                       # Add more AdGuard-style / hosts / domain lists as extra [[lists]] entries.\n\n";
-        std::fs::write(&path, format!("{header}{}", toml::to_string_pretty(&cfg)?))?;
-        Ok(cfg)
+        Ok(format!("{header}{}", toml::to_string_pretty(&Config::default())?))
+    }
+
+    /// Reads config.toml. If there is none, uses the defaults, and writes them out when allowed
+    /// to (the service can't write to /etc/foxhole; the installer writes the file instead).
+    pub fn load_or_create() -> Result<Self> {
+        std::fs::create_dir_all(data_dir()).context("creating data directory")?;
+        let path = Self::path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => return toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("reading {}", path.display()));
+            }
+            Err(_) => {}
+        }
+        let text = Self::default_toml()?;
+        let written = std::fs::create_dir_all(config_dir()).and_then(|()| std::fs::write(&path, text));
+        if written.is_err() {
+            tracing::info!(path = %path.display(), "no config file; using the defaults");
+        }
+        Ok(Config::default())
     }
 }
