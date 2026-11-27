@@ -8,8 +8,29 @@ with a plain-UDP fallback.
     cargo test
     cargo build --release          # target/release/foxhole
     sudo packaging/install.sh      # installs to /usr/local (PREFIX=... to change) and turns it on
+    foxhole uninstall [--purge]    # runs the uninstall.sh it installed in /usr/local/lib/foxhole
 
 TLS is rustls, so no OpenSSL headers are needed. Certificates are checked against the system trust store.
+
+## Releases
+Users install with `curl -fsSL https://raw.githubusercontent.com/FlashFennec22/Foxhole-Linux/main/install.sh | sh`.
+That script downloads `foxhole-<arch>-linux.tar.gz` and `SHA256SUMS` from the latest GitHub release, checks the
+tarball against them, unpacks it and runs the `install.sh` inside it (`packaging/install.sh`) through sudo.
+It needs the repository to be public. Testing it against a local build:
+
+    CC_x86_64_unknown_linux_musl=gcc packaging/dist.sh x86_64   # dist/foxhole-x86_64-linux.tar.gz (static)
+    (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+    FOXHOLE_BASE_URL=file://$PWD/dist sh install.sh
+
+To publish a release:
+1. Bump `version` in `Cargo.toml` and commit it to `main`.
+2. `git tag vX.Y.Z && git push origin vX.Y.Z`. `.github/workflows/release.yml` checks the tag matches
+   Cargo.toml, runs the tests, builds static x86_64 and aarch64 binaries (each on its own runner) and publishes
+   the release with the tarballs and `SHA256SUMS`.
+
+The checksums catch damaged or swapped downloads, but they come from the same place as the script, so whoever
+controls this repository controls what gets installed. Signing releases (as the Windows updater does) would only
+help once something already installed checks the signatures, such as a future updater.
 
 ## Use
     foxhole on           # turn on, now and at boot (also restarts it, to apply config.toml changes)

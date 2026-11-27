@@ -2,3 +2,4 @@
 /installer/Output
 # Update signing keys never belong in the repository (the public half is resources/update-signing.pub).
 *.key
+/dist

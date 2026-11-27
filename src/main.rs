@@ -31,6 +31,12 @@ enum Cmd {
     Off,
     /// Show whether protection is running
     Status,
+    /// Turn protection off and remove Foxhole (asks for the admin password)
+    Uninstall {
+        /// Also remove /etc/foxhole/config.toml and the foxhole system user
+        #[arg(long)]
+        purge: bool,
+    },
     /// Run in the foreground for debugging (Ctrl+C to stop). Needs root to listen on port 53.
     Run {
         /// Don't touch systemd-resolved; just listen on 127.0.0.1:53
@@ -84,6 +90,7 @@ fn main() -> Result<()> {
         }
         Cmd::On => turn_on(),
         Cmd::Off => turn_off(),
+        Cmd::Uninstall { purge } => uninstall(purge),
         Cmd::Status => {
             println!("{}", status());
             Ok(())
@@ -174,6 +181,27 @@ fn turn_off() -> Result<()> {
         bail!("DNS still points at Foxhole; run `sudo foxhole dns-restore` to undo that");
     }
     println!("Foxhole is OFF. DNS is back to your network's own servers.");
+    Ok(())
+}
+
+/// Runs the uninstall.sh that the installer put in <prefix>/lib/foxhole, through sudo unless
+/// we're already root.
+fn uninstall(purge: bool) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let prefix = exe.parent().and_then(|bin| bin.parent()).ok_or_else(|| anyhow::anyhow!("unexpected install location"))?;
+    let script = prefix.join("lib/foxhole/uninstall.sh");
+    if !script.exists() {
+        bail!("{} not found; was Foxhole installed with its install script?", script.display());
+    }
+    let is_root = Command::new("id").arg("-u").output().is_ok_and(|o| o.stdout.trim_ascii() == b"0");
+    let mut cmd = if is_root { Command::new("sh") } else { let mut c = Command::new("sudo"); c.arg("sh"); c };
+    cmd.arg(&script).env("PREFIX", prefix);
+    if purge {
+        cmd.arg("--purge");
+    }
+    if !cmd.status()?.success() {
+        bail!("uninstall failed");
+    }
     Ok(())
 }
 

@@ -1,13 +1,16 @@
 #!/bin/sh
-# Installs (or upgrades) Foxhole from a release build and turns protection on:
+# Installs (or upgrades) Foxhole and turns protection on. Run it as root, either from a source tree
 #   cargo build --release && sudo packaging/install.sh
-# PREFIX defaults to /usr/local. Remove it again with packaging/uninstall.sh.
+# or from an unpacked release (the curl installer at the top of the repository does that).
+# PREFIX defaults to /usr/local. Remove it again with `foxhole uninstall`.
 set -eu
 
 PREFIX=${PREFIX:-/usr/local}
 BINDIR=$PREFIX/bin
+LIBDIR=$PREFIX/lib/foxhole
 HERE=$(cd "$(dirname "$0")" && pwd)
-BIN=$HERE/../target/release/foxhole
+# A release has the binary next to this script; a source tree has it under target/.
+if [ -e "$HERE/foxhole" ]; then BIN=$HERE/foxhole; else BIN=$HERE/../target/release/foxhole; fi
 
 [ "$(id -u)" = 0 ] || { echo "Run this as root (sudo $0)." >&2; exit 1; }
 [ -x "$BIN" ] || { echo "$BIN not found; run 'cargo build --release' first." >&2; exit 1; }
@@ -15,6 +18,7 @@ systemctl is-active --quiet systemd-resolved || {
     echo "Foxhole needs systemd-resolved, which isn't running here." >&2; exit 1; }
 
 install -D -m 0755 "$BIN" "$BINDIR/foxhole"
+install -D -m 0755 "$HERE/uninstall.sh" "$LIBDIR/uninstall.sh"
 install -D -m 0644 "$HERE/foxhole.sysusers" /usr/lib/sysusers.d/foxhole.conf
 systemd-sysusers /usr/lib/sysusers.d/foxhole.conf
 sed "s|@BINDIR@|$BINDIR|g" "$HERE/foxhole.service" > /etc/systemd/system/foxhole.service

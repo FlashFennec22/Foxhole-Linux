@@ -20,15 +20,27 @@ Content blocking of any kind implies a risk of bumping into false positives. You
 
 ## How do I install it?
 
-There are no packages yet. Build and install it from source (needs a Rust toolchain):
+Paste this into a terminal (it asks for your password, then turns protection on):
+
+    curl -fsSL https://raw.githubusercontent.com/FlashFennec22/Foxhole-Linux/main/install.sh | sh
+
+It downloads the latest release for your machine (x86_64 or ARM64), checks it against the release's checksums and installs it to `/usr/local`. Run it again to upgrade; your settings are kept. Prefer to read it first? Download [install.sh](install.sh), look it over, then run `sh install.sh`.
+
+To build it yourself instead (needs a Rust toolchain):
 
     cargo build --release
     sudo packaging/install.sh
 
+## How do I turn it off or check on it?
+
+    foxhole off       # turn protection off (stays off across reboots)
+    foxhole on        # turn it back on
+    foxhole status
+
 ## How do I uninstall it?
 
-    sudo packaging/uninstall.sh            # keeps /etc/foxhole/config.toml
-    sudo packaging/uninstall.sh --purge    # removes that too
+    foxhole uninstall            # keeps /etc/foxhole/config.toml
+    foxhole uninstall --purge    # removes that too
 
 ## Thanks and considerations
 

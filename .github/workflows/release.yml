@@ -1,0 +1,73 @@
+# Builds the release tarballs that install.sh downloads, when a version tag is pushed:
+#   (bump version in Cargo.toml, commit)  git tag v0.2.0 && git push origin v0.2.0
+# Each architecture builds natively on its own runner, as a static (musl) binary.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME but Cargo.toml says $version"; exit 1; }
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup update stable && rustup default stable
+          rustup target add "$TARGET"
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build tarball
+        # ring (rustls's crypto) has C code; build it with musl's compiler.
+        run: |
+          export "CC_$(echo "$TARGET" | tr - _)=musl-gcc"
+          packaging/dist.sh ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: foxhole-${{ matrix.arch }}
+          path: dist/foxhole-${{ matrix.arch }}-linux.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "Foxhole for Linux $GITHUB_REF_NAME" --generate-notes
