@@ -1,6 +1,6 @@
 [package]
 name = "foxhole"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 description = "System-wide DNS ad blocker for Linux (AdGuard-style lists, Hagezi Pro++ by default)"
 
