@@ -40,7 +40,7 @@ pub fn apply(_ipv6: bool) -> Result<()> {
     let tmp = format!("{DROP_IN}.tmp");
     fs::write(&tmp, CONTENT).with_context(|| format!("writing {tmp}"))?;
     fs::rename(&tmp, DROP_IN).with_context(|| format!("creating {DROP_IN}"))?;
-    reload_resolved().context("reloading systemd-resolved")?;
+    reload_resolved(Wait::Yes).context("reloading systemd-resolved")?;
     info!("systemd-resolved now forwards to Foxhole");
     Ok(())
 }
@@ -58,21 +58,39 @@ pub fn restore() -> Result<()> {
     if output.is_ok_and(|o| o.stdout.starts_with(b"stopping")) {
         return Ok(());
     }
-    reload_resolved().context("reloading systemd-resolved")?;
+    // Don't wait for the reload: this runs from foxhole.service's ExecStop/ExecStopPost, and
+    // systemd queues resolved's reload behind our stop job (we're After= it, and stops go first).
+    // Waiting would deadlock until systemd killed us at the stop timeout, 90 s by default.
+    reload_resolved(Wait::No).context("reloading systemd-resolved")?;
     info!("systemd-resolved restored to the network's DNS servers");
     Ok(())
 }
 
-/// Makes resolved re-read its config, then empties its cache so answers from before the change
-/// (blocked or not) aren't served from it. `--job-mode=fail` so we never cancel a job systemd
-/// already has queued for resolved (a stop, say).
-fn reload_resolved() -> Result<()> {
-    if !systemctl(&["--job-mode=fail", "try-reload-or-restart", "systemd-resolved.service"]) {
+#[derive(PartialEq)]
+enum Wait {
+    Yes,
+    No,
+}
+
+/// Makes resolved re-read its config, which also empties its cache, so answers from before the
+/// change (blocked or not) aren't served from it. `--job-mode=fail` so we never cancel a job
+/// systemd already has queued for resolved (a stop, say). With `Wait::No` the reload is only
+/// queued, and runs as soon as systemd gets to it.
+fn reload_resolved(wait: Wait) -> Result<()> {
+    let mut args = vec!["--job-mode=fail", "try-reload-or-restart", "systemd-resolved.service"];
+    if wait == Wait::No {
+        args.insert(0, "--no-block");
+    }
+    if !systemctl(&args) {
         bail!("systemctl reload failed");
     }
-    match Command::new("resolvectl").arg("flush-caches").status() {
-        Ok(s) if s.success() => {}
-        _ => warn!("could not flush systemd-resolved's cache; old answers may linger for their TTL"),
+    // The reload (or restart) already empties the cache; this is belt and braces. It only helps once
+    // the reload has happened: before that, resolved would just refill it from the old server.
+    if wait == Wait::Yes {
+        match Command::new("resolvectl").arg("flush-caches").status() {
+            Ok(s) if s.success() => {}
+            _ => warn!("could not flush systemd-resolved's cache; old answers may linger for their TTL"),
+        }
     }
     Ok(())
 }

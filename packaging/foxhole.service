@@ -18,6 +18,9 @@ ExecStart=@BINDIR@/foxhole service
 ExecStartPost=+@BINDIR@/foxhole dns-apply
 ExecStop=+@BINDIR@/foxhole dns-restore
 ExecStopPost=+@BINDIR@/foxhole dns-restore
+# Stopping takes well under a second; don't let anything that hangs hold up a restart for systemd's
+# default 90 s.
+TimeoutStopSec=15s
 Restart=on-failure
 RestartSec=10s
 RestartSteps=3

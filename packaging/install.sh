@@ -29,4 +29,5 @@ install -d -m 0755 /etc/foxhole
 [ -e /etc/foxhole/config.toml ] || "$BINDIR/foxhole" default-config > /etc/foxhole/config.toml
 
 systemctl daemon-reload
+echo "foxhole: installed to $PREFIX; starting the service"
 "$BINDIR/foxhole" on
