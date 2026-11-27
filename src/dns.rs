@@ -70,41 +70,55 @@ fn blocked_response(req: &Message, q: &Query) -> Option<Vec<u8>> {
 /// Core logic shared by UDP and TCP: block locally, answer from the cache, or forward upstream.
 async fn handle(packet: &[u8], state: &State) -> Option<Vec<u8>> {
     let req = Message::from_vec(packet).ok()?;
+    // Never answer an answer: that's how two resolvers end up bouncing packets between them.
+    if req.message_type != MessageType::Query {
+        return None;
+    }
     state.total.fetch_add(1, Relaxed);
+    // The blocklist judges exactly one question, so anything else is answered here and never
+    // forwarded: a packet with two questions must not take a blocked name past the blocklist.
+    if let Some(rcode) = unsupported(&req) {
+        return base_response(&req, rcode).to_vec().ok();
+    }
 
-    let mut cache_key = None;
-    if req.message_type == MessageType::Query && req.op_code == OpCode::Query && req.queries.len() == 1 {
-        let q = &req.queries[0];
-        let name = q.name().to_ascii().trim_end_matches('.').to_ascii_lowercase();
+    let q = &req.queries[0];
+    let name = q.name().to_ascii().trim_end_matches('.').to_ascii_lowercase();
 
-        // Tells Firefox not to bypass us with its built-in DoH.
-        if name == "use-application-dns.net" {
-            return base_response(&req, ResponseCode::NXDomain).to_vec().ok();
-        }
-        if state.matcher().is_blocked(&name) {
-            state.blocked.fetch_add(1, Relaxed);
-            debug!(%name, "blocked");
-            return blocked_response(&req, q);
-        }
-        // Checked after the blocklist, so a list update applies to cached names straight away.
-        let key = cache::Key::new(&req, &name);
-        if let Some(resp) = state.cache.get(&key, &req) {
-            return Some(resp);
-        }
-        cache_key = Some(key);
+    // Tells Firefox not to bypass us with its built-in DoH.
+    if name == "use-application-dns.net" {
+        return base_response(&req, ResponseCode::NXDomain).to_vec().ok();
+    }
+    if state.matcher().is_blocked(&name) {
+        state.blocked.fetch_add(1, Relaxed);
+        debug!(%name, "blocked");
+        return blocked_response(&req, q);
+    }
+    // Checked after the blocklist, so a list update applies to cached names straight away.
+    let key = cache::Key::new(&req, &name);
+    if let Some(resp) = state.cache.get(&key, &req) {
+        return Some(resp);
     }
 
     match state.upstream.resolve(packet).await {
         Ok(r) => {
-            if let Some(key) = cache_key {
-                state.cache.insert(key, &req, &r);
-            }
+            state.cache.insert(key, &req, &r);
             Some(r)
         }
         Err(e) => {
             debug!(error = %e, "upstream failure");
             base_response(&req, ResponseCode::ServFail).to_vec().ok()
         }
+    }
+}
+
+/// The error to answer with if `req` isn't a standard query with exactly one question.
+fn unsupported(req: &Message) -> Option<ResponseCode> {
+    if req.op_code != OpCode::Query {
+        Some(ResponseCode::NotImp)
+    } else if req.queries.len() != 1 {
+        Some(ResponseCode::FormErr)
+    } else {
+        None
     }
 }
 
@@ -253,6 +267,49 @@ mod tests {
         assert_eq!(r.id, 0x1234);
         assert!(r.answers.is_empty());
         assert_eq!(r.queries.len(), 1);
+    }
+
+    /// A resolver that blocks `ads.example` and has no upstream at all, so anything it forwards
+    /// comes back SERVFAIL.
+    fn offline_state() -> State {
+        let mut m = Matcher::default();
+        m.block_domain("ads.example");
+        let up = crate::config::UpstreamConfig { timeout_ms: 200, fallback: vec![], doh: vec![] };
+        State::new(m, Upstream::new(&up).unwrap())
+    }
+
+    async fn ask(state: &State, req: &Message) -> Option<Message> {
+        handle(&req.to_vec().unwrap(), state).await.map(|w| Message::from_vec(&w).unwrap())
+    }
+
+    #[tokio::test]
+    async fn two_questions_cannot_slip_past_the_blocklist() {
+        let state = offline_state();
+        let mut req = query("ads.example.", RecordType::A);
+        req.add_query(Query::query(Name::from_str("example.com.").unwrap(), RecordType::A));
+        let r = ask(&state, &req).await.unwrap();
+        assert_eq!(r.response_code, ResponseCode::FormErr);
+        assert!(r.answers.is_empty());
+
+        let mut empty = query("ads.example.", RecordType::A);
+        empty.queries.clear();
+        assert_eq!(ask(&state, &empty).await.unwrap().response_code, ResponseCode::FormErr);
+
+        // A normal query for the same name is still blocked.
+        let r = ask(&state, &query("ads.example.", RecordType::A)).await.unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::UNSPECIFIED)));
+    }
+
+    #[tokio::test]
+    async fn other_opcodes_and_responses_are_not_forwarded() {
+        let state = offline_state();
+        let mut req = query("ads.example.", RecordType::A);
+        req.metadata.op_code = OpCode::Status;
+        assert_eq!(ask(&state, &req).await.unwrap().response_code, ResponseCode::NotImp);
+
+        let mut resp = query("ads.example.", RecordType::A);
+        resp.metadata.message_type = MessageType::Response;
+        assert!(ask(&state, &resp).await.is_none());
     }
 
     #[test]
