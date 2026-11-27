@@ -10,7 +10,7 @@ mod upstream;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
-use std::{collections::HashMap, process::Command, sync::Arc};
+use std::{collections::HashMap, ffi::OsString, path::Path, process::Command, sync::Arc};
 use tokio::sync::Notify;
 
 /// The systemd unit installed by packaging/install.sh.
@@ -194,15 +194,30 @@ fn uninstall(purge: bool) -> Result<()> {
         bail!("{} not found; was Foxhole installed with its install script?", script.display());
     }
     let is_root = Command::new("id").arg("-u").output().is_ok_and(|o| o.stdout.trim_ascii() == b"0");
-    let mut cmd = if is_root { Command::new("sh") } else { let mut c = Command::new("sudo"); c.arg("sh"); c };
-    cmd.arg(&script).env("PREFIX", prefix);
-    if purge {
-        cmd.arg("--purge");
-    }
-    if !cmd.status()?.success() {
+    if !uninstall_command(&script, prefix, purge, is_root).status()?.success() {
         bail!("uninstall failed");
     }
     Ok(())
+}
+
+/// `[sudo] env PREFIX=<prefix> sh <script> [--purge]`. PREFIX goes on the command line rather than
+/// in our environment because sudo starts commands with a clean environment, which would drop it
+/// and make uninstall.sh look in /usr/local whatever the real prefix is.
+fn uninstall_command(script: &Path, prefix: &Path, purge: bool, is_root: bool) -> Command {
+    let mut assign = OsString::from("PREFIX=");
+    assign.push(prefix);
+    let mut cmd = if is_root {
+        Command::new("env")
+    } else {
+        let mut c = Command::new("sudo");
+        c.arg("env");
+        c
+    };
+    cmd.arg(assign).arg("sh").arg(script);
+    if purge {
+        cmd.arg("--purge");
+    }
+    cmd
 }
 
 fn status() -> &'static str {
@@ -215,5 +230,25 @@ fn status() -> &'static str {
         ("loaded", "failed", _) => "OFF (couldn't start; see `journalctl -u foxhole`, `foxhole on` to retry)",
         ("loaded", _, _) => "OFF (service stopped)",
         _ => "not installed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(cmd: &Command) -> Vec<String> {
+        std::iter::once(cmd.get_program()).chain(cmd.get_args()).map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn uninstall_passes_prefix_through_sudo() {
+        let (script, prefix) = (Path::new("/opt/fh/lib/foxhole/uninstall.sh"), Path::new("/opt/fh"));
+        let cmd = uninstall_command(script, prefix, true, false);
+        assert_eq!(args(&cmd), ["sudo", "env", "PREFIX=/opt/fh", "sh", "/opt/fh/lib/foxhole/uninstall.sh", "--purge"]);
+        assert_eq!(cmd.get_envs().count(), 0, "sudo would drop it from the environment");
+
+        let cmd = uninstall_command(script, prefix, false, true);
+        assert_eq!(args(&cmd), ["env", "PREFIX=/opt/fh", "sh", "/opt/fh/lib/foxhole/uninstall.sh"]);
     }
 }
