@@ -1,0 +1,2 @@
+# The account the resolver runs as (foxhole.service).
+u foxhole - "Foxhole DNS ad blocker" /var/lib/foxhole -

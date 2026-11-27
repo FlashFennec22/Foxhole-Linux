@@ -1,230 +1,219 @@
 mod cache;
 mod config;
-#[cfg(windows)]
-mod datadir;
 mod dns;
 mod engine;
 mod lists;
 mod rules;
 mod sysdns;
 mod upstream;
-#[cfg(windows)]
-mod service;
-#[cfg(windows)]
-mod trayctl;
-#[cfg(windows)]
-mod winctl;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use config::{data_dir, Config};
-use std::sync::{Arc, Mutex};
+use config::Config;
+use std::{collections::HashMap, process::Command, sync::Arc};
 use tokio::sync::Notify;
 
+/// The systemd unit installed by packaging/install.sh.
+const UNIT: &str = "foxhole.service";
+
 #[derive(Parser)]
-#[command(name = "foxhole", version, about = "One-click DNS ad blocker (AdGuard-style lists; Hagezi Pro++ by default)")]
+#[command(name = "foxhole", version, about = "System-wide DNS ad blocker (AdGuard-style lists; Hagezi Pro++ by default)")]
 struct Cli {
     #[command(subcommand)]
-    cmd: Option<Cmd>,
-    /// Internal: set on the copy started through UAC, so it never tries to elevate again.
-    #[arg(long, hide = true, global = true)]
-    elevated: bool,
+    cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Turn protection on (and restart it, to apply config changes). This is also what double-clicking does.
-    On {
-        #[arg(long, hide = true)]
-        pause: bool,
-        #[arg(long, hide = true)]
-        no_tray: bool,
-    },
-    /// Turn protection off and restore the original DNS settings
+    /// Turn protection on, now and at every boot (also restarts it, to apply config changes)
+    On,
+    /// Turn protection off and give DNS back to the network's own servers
     Off,
     /// Show whether protection is running
     Status,
-    /// Open the uninstaller (restores your DNS settings and removes Foxhole)
-    Uninstall,
-    /// Run in the foreground for debugging (Ctrl+C to stop)
+    /// Turn protection off and remove Foxhole (asks for the admin password)
+    Uninstall {
+        /// Also remove /etc/foxhole/config.toml and the foxhole system user
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Run in the foreground for debugging (Ctrl+C to stop). Needs root to listen on port 53.
     Run {
-        /// Don't touch Windows' DNS settings; just listen on 127.0.0.1:53
+        /// Don't touch systemd-resolved; just listen on 127.0.0.1:53
         #[arg(long)]
         no_system_dns: bool,
     },
-    /// Internal: entry point used by the Windows Service Control Manager
+    /// Internal: the resolver itself, started by foxhole.service
     #[command(hide = true)]
     Service,
-    /// Internal (installer): register the service for this exe and start it
+    /// Internal (foxhole.service, as root): point systemd-resolved at Foxhole
     #[command(hide = true)]
-    InstallService {
-        /// Register it with protection off (manual start), e.g. when upgrading an install that was off
-        #[arg(long)]
-        off: bool,
-    },
-    /// Internal (installer): stop the service and tray icons before an upgrade replaces the files
+    DnsApply,
+    /// Internal (foxhole.service, as root): point systemd-resolved back at the network's DNS
     #[command(hide = true)]
-    PrepareUpgrade,
-    /// Internal (uninstaller): restore DNS and remove the service
+    DnsRestore,
+    /// Internal (installer): print a config.toml with the default settings
     #[command(hide = true)]
-    UninstallService,
+    DefaultConfig,
 }
 
-fn init_logging(to_file: bool) {
+/// Logs to stderr; under systemd that ends up in the journal (`journalctl -u foxhole`).
+fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    if to_file {
-        let _ = std::fs::create_dir_all(data_dir());
-        let path = data_dir().join("foxhole.log");
-        // crude rotation: start fresh once the log passes 5 MB
-        if std::fs::metadata(&path).map(|m| m.len() > 5_000_000).unwrap_or(false) {
-            let _ = std::fs::remove_file(&path);
-        }
-        if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(Mutex::new(f)).init();
-            return;
-        }
+    let under_systemd = std::env::var_os("INVOCATION_ID").is_some();
+    // The journal timestamps every line itself.
+    let fmt = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    if under_systemd {
+        fmt.with_ansi(false).without_time().init();
+    } else {
+        fmt.init();
     }
-    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Some(Cmd::Run { no_system_dns }) => run_foreground(!no_system_dns),
-        other => windows_cmd(other.unwrap_or(Cmd::On { pause: true, no_tray: false }), cli.elevated),
+        Cmd::Run { no_system_dns } => resolver(!no_system_dns),
+        Cmd::Service => resolver(false),
+        Cmd::DnsApply => {
+            init_logging();
+            sysdns::apply(false)
+        }
+        Cmd::DnsRestore => {
+            init_logging();
+            sysdns::restore()
+        }
+        Cmd::DefaultConfig => {
+            print!("{}", Config::default_toml()?);
+            Ok(())
+        }
+        Cmd::On => turn_on(),
+        Cmd::Off => turn_off(),
+        Cmd::Uninstall { purge } => uninstall(purge),
+        Cmd::Status => {
+            println!("{}", status());
+            Ok(())
+        }
     }
 }
 
-fn run_foreground(manage_dns: bool) -> Result<()> {
-    init_logging(false);
+/// Runs the resolver until SIGTERM or Ctrl+C. As the service, systemd (not us) points resolved
+/// at it, from foxhole.service's ExecStartPost, once we report ready.
+fn resolver(manage_dns: bool) -> Result<()> {
+    init_logging();
     let cfg = Config::load_or_create()?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
         let shutdown = Arc::new(Notify::new());
         let s2 = shutdown.clone();
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
             s2.notify_one();
         });
-        engine::run(cfg, shutdown, manage_dns, || {}).await
+        engine::run(cfg, shutdown, manage_dns, || sd_notify("READY=1")).await
     })
 }
 
-/// Secures the data folder, then starts logging into it. The error is logged too, because this is
-/// where someone would look; a planted log file can't do more harm than receive that one message.
-#[cfg(windows)]
-fn secure_data_dir() -> Result<()> {
-    let r = datadir::secure();
-    init_logging(true);
-    datadir::log_notes();
-    if let Err(e) = &r {
-        tracing::error!(error = %format!("{e:#}"), "could not secure the data folder");
-    }
-    r
-}
-
-#[cfg(not(windows))]
-fn windows_cmd(_: Cmd, _: bool) -> Result<()> {
-    anyhow::bail!("this command is only available on Windows (use `run --no-system-dns` to test elsewhere)")
-}
-
-#[cfg(windows)]
-fn windows_cmd(cmd: Cmd, elevated: bool) -> Result<()> {
-    use winctl::Status;
-
-    // If we aren't elevated, hands the job to an elevated copy of ourselves and returns its exit code.
-    let elevate = |args: &[&str]| -> Result<Option<u32>> {
-        if winctl::is_admin() {
-            return Ok(None);
-        }
-        if elevated {
-            anyhow::bail!("this needs administrator rights, but the elevated copy didn't get them");
-        }
-        winctl::relaunch_elevated(args).map(Some)
+/// Tells systemd (Type=notify) how we're doing. Does nothing when not started by systemd.
+fn sd_notify(state: &str) {
+    use std::os::{linux::net::SocketAddrExt, unix::net::{SocketAddr, UnixDatagram}};
+    let Some(path) = std::env::var_os("NOTIFY_SOCKET") else { return };
+    let path = path.to_string_lossy();
+    let addr = match path.strip_prefix('@') {
+        Some(name) => SocketAddr::from_abstract_name(name),
+        None => SocketAddr::from_pathname(&*path),
     };
-    fn pause() {
-        println!("\nPress Enter to close...");
-        let mut s = String::new();
-        let _ = std::io::stdin().read_line(&mut s);
+    let sent = addr.and_then(|a| UnixDatagram::unbound()?.send_to_addr(state.as_bytes(), &a));
+    if let Err(e) = sent {
+        tracing::warn!(error = %e, "could not notify systemd");
     }
+}
 
-    match cmd {
-        Cmd::On { pause: p, no_tray } => {
-            // The elevated copy skips the tray; we launch it afterwards un-elevated, as the user.
-            let mut args = vec!["on", "--no-tray"];
-            if p { args.push("--pause"); }
-            if let Some(code) = elevate(&args)? {
-                if code == 0 { winctl::launch_tray(); }
-                std::process::exit(code as i32);
-            }
-            let r = winctl::turn_on();
-            match &r {
-                Ok(()) => println!("\nFoxhole is ON. Ads and trackers are now blocked system-wide."),
-                Err(e) => println!("\nCould not start Foxhole: {e:#}"),
-            }
-            if r.is_ok() && !no_tray { winctl::launch_tray(); }
-            if p { pause(); }
-            // The error was already shown above; just report it through the exit code.
-            if r.is_err() { std::process::exit(1); }
-            Ok(())
-        }
-        Cmd::Off => {
-            if let Some(code) = elevate(&["off"])? { std::process::exit(code as i32); }
-            init_logging(false);
-            // Restoring DNS reads dns-state.json, so check the folder first. A failure is no reason
-            // to leave the machine's DNS pointed at a stopped resolver.
-            let secured = datadir::secure();
-            datadir::log_notes();
-            if let Err(e) = secured {
-                tracing::warn!(error = %format!("{e:#}"), "could not secure the data folder");
-            }
-            winctl::turn_off()?;
-            println!("Foxhole is OFF. Your original DNS settings were restored.");
-            Ok(())
-        }
-        Cmd::Uninstall => winctl::run_uninstaller(),
-        Cmd::Status => {
-            println!("{}", match winctl::status() {
-                Status::Running => "ON (service running)",
-                Status::Stopped => "OFF (service stopped)",
-                Status::Retrying => "OFF (couldn't start; trying again shortly)",
-                Status::NotInstalled => "not installed",
-                Status::Other => "starting/stopping",
-            });
-            Ok(())
-        }
-        Cmd::Service => {
-            // Before the log file or config are touched. Refuse to run on files we can't trust.
-            if let Err(e) = secure_data_dir() {
-                // The adapters may still point at us from a run that never restored them. The saved
-                // originals are in the folder we couldn't secure, so don't read them: just take our
-                // addresses off, rather than leave the machine with a resolver that isn't there.
-                if let Err(e) = sysdns::clear_loopback() {
-                    tracing::error!(error = %format!("{e:#}"), "could not take Foxhole out of the DNS settings; run `foxhole off`");
-                }
-                return Err(e);
-            }
-            service::dispatch().map_err(Into::into)
-        }
-        // Run by the (already elevated) installer with no console; details go to foxhole.log.
-        Cmd::InstallService { .. } | Cmd::PrepareUpgrade | Cmd::UninstallService => {
-            if !winctl::is_admin() {
-                init_logging(false);
-                anyhow::bail!("this command is for the installer and needs administrator rights");
-            }
-            let secured = secure_data_dir();
-            let r = match cmd {
-                // Removal carries on regardless, but never start protection on an unsafe folder.
-                Cmd::InstallService { off } => secured.and_then(|()| winctl::install_service(off)),
-                Cmd::PrepareUpgrade => winctl::prepare_upgrade(),
-                _ => winctl::uninstall_service(),
-            };
-            if let Err(e) = &r {
-                tracing::error!(error = %format!("{e:#}"), "installer step failed");
-            }
-            r
-        }
-        Cmd::Run { .. } => unreachable!(),
+/// Runs systemctl in the foreground, so it can ask for the admin password (polkit) if needed.
+fn systemctl(args: &[&str]) -> Result<()> {
+    let status = Command::new("systemctl").args(args).status()?;
+    if !status.success() {
+        bail!("`systemctl {}` failed", args.join(" "));
+    }
+    Ok(())
+}
+
+/// The unit's LoadState / ActiveState / SubState.
+fn unit_state() -> HashMap<String, String> {
+    let out = Command::new("systemctl")
+        .args(["show", UNIT, "--property=LoadState,ActiveState,SubState"])
+        .output();
+    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
+}
+
+fn installed() -> bool {
+    unit_state().get("LoadState").is_some_and(|s| s == "loaded")
+}
+
+fn turn_on() -> Result<()> {
+    if !installed() {
+        bail!("Foxhole isn't installed ({UNIT} not found); run packaging/install.sh first");
+    }
+    // A restart rather than a start, so config.toml changes apply. reset-failed lets it start
+    // again after it gave up (too many failed starts in a row).
+    let _ = Command::new("systemctl").args(["reset-failed", UNIT]).output();
+    let r = systemctl(&["enable", UNIT]).and_then(|()| systemctl(&["restart", UNIT]));
+    match r {
+        Ok(()) => println!("Foxhole is ON. Ads and trackers are now blocked system-wide."),
+        Err(e) => bail!("could not start Foxhole ({e:#}); see `journalctl -u foxhole`"),
+    }
+    Ok(())
+}
+
+fn turn_off() -> Result<()> {
+    if installed() {
+        systemctl(&["disable", "--now", UNIT])?;
+    }
+    // The service takes itself out of resolved's settings when it stops. If something went wrong
+    // there (or a `foxhole run` was killed), say how to fix it rather than leave DNS broken.
+    if sysdns::is_applied() {
+        bail!("DNS still points at Foxhole; run `sudo foxhole dns-restore` to undo that");
+    }
+    println!("Foxhole is OFF. DNS is back to your network's own servers.");
+    Ok(())
+}
+
+/// Runs the uninstall.sh that the installer put in <prefix>/lib/foxhole, through sudo unless
+/// we're already root.
+fn uninstall(purge: bool) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let prefix = exe.parent().and_then(|bin| bin.parent()).ok_or_else(|| anyhow::anyhow!("unexpected install location"))?;
+    let script = prefix.join("lib/foxhole/uninstall.sh");
+    if !script.exists() {
+        bail!("{} not found; was Foxhole installed with its install script?", script.display());
+    }
+    let is_root = Command::new("id").arg("-u").output().is_ok_and(|o| o.stdout.trim_ascii() == b"0");
+    let mut cmd = if is_root { Command::new("sh") } else { let mut c = Command::new("sudo"); c.arg("sh"); c };
+    cmd.arg(&script).env("PREFIX", prefix);
+    if purge {
+        cmd.arg("--purge");
+    }
+    if !cmd.status()?.success() {
+        bail!("uninstall failed");
+    }
+    Ok(())
+}
+
+fn status() -> &'static str {
+    let s = unit_state();
+    let get = |k: &str| s.get(k).map(String::as_str).unwrap_or("");
+    match (get("LoadState"), get("ActiveState"), get("SubState")) {
+        ("loaded", "active", _) => "ON (service running)",
+        ("loaded", "activating", "auto-restart") => "OFF (couldn't start; trying again shortly)",
+        ("loaded", "activating" | "deactivating" | "reloading", _) => "starting/stopping",
+        ("loaded", "failed", _) => "OFF (couldn't start; see `journalctl -u foxhole`, `foxhole on` to retry)",
+        ("loaded", _, _) => "OFF (service stopped)",
+        _ => "not installed",
     }
 }
